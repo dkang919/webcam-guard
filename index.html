@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0D1117">
+<title>Guard</title>
+<!-- 폰트는 static/ 에 내장돼 있다 (tools/vendor.py 가 받아둔 것).
+     파일이 없으면 아래 CSS 변수의 시스템 폰트로 자연스럽게 내려간다. -->
+<link rel="stylesheet" href="/static/fonts.css">
+<style>
+  :root{
+    --ink:#0D1117; --panel:#151B24; --line:#25303F;
+    --bone:#E6E1D5; --dim:#78849A; --sodium:#F2A73B;
+    --mono:"IBM Plex Mono",ui-monospace,monospace;
+    --sans:"IBM Plex Sans",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--ink); color:var(--bone); font-family:var(--sans);
+    font-size:15px; line-height:1.45;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:0 14px 48px}
+
+  /* ---- header ------------------------------------------------------- */
+  header{
+    display:flex;align-items:baseline;gap:12px;
+    padding:18px 2px 14px;border-bottom:1px solid var(--line);
+  }
+  .chan{font-family:var(--mono);font-weight:600;font-size:13px;letter-spacing:.16em;text-transform:uppercase}
+  .tally{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--dim)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+  .tally.on{color:var(--sodium)}
+  .tally.on .dot{background:var(--sodium);animation:pulse 2s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.25}}
+  .clock{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+
+  /* ---- video -------------------------------------------------------- */
+  .stage{position:relative;margin:14px 0;background:#000;border:1px solid var(--line);aspect-ratio:16/9;overflow:hidden}
+  video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
+  .stage figcaption{
+    position:absolute;left:0;right:0;bottom:0;
+    display:flex;justify-content:space-between;gap:10px;
+    padding:7px 10px;background:linear-gradient(transparent,rgba(0,0,0,.75));
+    font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--bone);
+    text-transform:uppercase;pointer-events:none;
+  }
+  .veil{
+    position:absolute;inset:0;display:grid;place-content:center;gap:8px;text-align:center;
+    background:var(--panel);font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:var(--dim)
+  }
+  .veil[hidden]{display:none}
+
+  /* ---- tabs --------------------------------------------------------- */
+  .tabs{display:flex;gap:22px;border-bottom:1px solid var(--line);margin-bottom:16px}
+  .tabs button{
+    appearance:none;background:none;border:0;padding:10px 0;cursor:pointer;
+    font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--dim);border-bottom:2px solid transparent;margin-bottom:-1px;
+  }
+  .tabs button[aria-selected="true"]{color:var(--bone);border-bottom-color:var(--sodium)}
+  .tabs button:focus-visible,a:focus-visible,.tick:focus-visible,.row:focus-visible{outline:2px solid var(--sodium);outline-offset:2px}
+
+  /* ---- meters ------------------------------------------------------- */
+  .meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+  .meter{background:var(--panel);padding:12px 14px}
+  .meter dt{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+  .meter dd{margin:5px 0 0;font-family:var(--mono);font-size:19px;font-variant-numeric:tabular-nums}
+  .bar{height:3px;background:var(--line);margin-top:9px}
+  .bar span{display:block;height:100%;background:var(--sodium)}
+
+  /* ---- day chips ---------------------------------------------------- */
+  .days{display:flex;gap:8px;overflow-x:auto;padding-bottom:12px;scrollbar-width:none}
+  .days::-webkit-scrollbar{display:none}
+  .days button{
+    flex:0 0 auto;appearance:none;cursor:pointer;
+    background:var(--panel);border:1px solid var(--line);color:var(--dim);
+    padding:7px 12px;font-family:var(--mono);font-size:12px;letter-spacing:.06em;
+  }
+  .days button[aria-pressed="true"]{color:var(--ink);background:var(--sodium);border-color:var(--sodium);font-weight:600}
+
+  /* ---- signature: 24h strip ----------------------------------------- */
+  .strip{position:relative;height:52px;background:var(--panel);border:1px solid var(--line);margin-bottom:6px}
+  .strip .hour{position:absolute;top:0;bottom:0;width:1px;background:var(--line)}
+  .tick{
+    position:absolute;top:9px;bottom:9px;min-width:3px;padding:0;border:0;cursor:pointer;
+    background:rgba(242,167,59,.5);
+  }
+  .tick:hover,.tick.sel{background:var(--sodium)}
+  .scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.08em;margin-bottom:22px}
+
+  /* ---- clip rows ---------------------------------------------------- */
+  .row{
+    display:flex;align-items:center;gap:14px;width:100%;text-align:left;cursor:pointer;
+    background:none;border:0;border-bottom:1px solid var(--line);padding:12px 4px;color:var(--bone);
+  }
+  .row:hover{background:var(--panel)}
+  .row.sel{background:var(--panel);box-shadow:inset 3px 0 0 var(--sodium)}
+  .row time{font-family:var(--mono);font-size:15px;font-variant-numeric:tabular-nums;letter-spacing:.04em}
+  .row .mb{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .empty{padding:28px 4px;color:var(--dim);font-family:var(--mono);font-size:12px;letter-spacing:.08em}
+  [hidden]{display:none !important}
+  @media (prefers-reduced-motion:reduce){*{animation:none !important;transition:none !important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="chan" id="chan">—</span>
+    <span class="tally" id="tally"><span class="dot"></span><span id="tallyText">연결 중</span></span>
+    <span class="clock" id="clock">--:--:--</span>
+  </header>
+
+  <figure class="stage" style="margin-block:14px">
+    <video id="v" playsinline controls muted autoplay></video>
+    <div class="veil" id="veil"><span>신호 없음</span><span id="veilHint">카메라를 확인하는 중</span></div>
+    <figcaption><span id="capLeft">LIVE</span><span id="capRight"></span></figcaption>
+  </figure>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="tabLive" aria-selected="true">실시간</button>
+    <button role="tab" id="tabArch" aria-selected="false">기록</button>
+  </nav>
+
+  <section id="paneLive">
+    <dl class="meters">
+      <div class="meter"><dt>가동 시간</dt><dd id="mUp">—</dd></div>
+      <div class="meter"><dt>재시작</dt><dd id="mRe">—</dd></div>
+      <div class="meter">
+        <dt>저장 공간</dt><dd id="mDisk">—</dd>
+        <div class="bar"><span id="mBar" style="width:0"></span></div>
+      </div>
+      <div class="meter"><dt>보관 기간</dt><dd id="mKeep">—</dd></div>
+    </dl>
+  </section>
+
+  <section id="paneArch" hidden>
+    <div class="days" id="days"></div>
+    <div class="strip" id="strip"></div>
+    <div class="scale"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+    <div id="rows"></div>
+  </section>
+
+</div>
+
+<!-- 로컬 hls.js 를 먼저 쓴다. 감시 PC 가 인터넷에 못 나가는 상황(Tailscale 전용,
+     회선 장애)에서도 안드로이드 라이브 재생이 살아 있어야 하기 때문.
+     static/ 없이 두 파일만 복사해 간 경우를 위해 CDN 폴백을 남겨둔다. -->
+<script src="/static/hls.min.js"></script>
+<script>
+if (!window.Hls) {
+  document.write('<script src="https:\/\/cdnjs.cloudflare.com\/ajax\/libs\/hls.js\/1.5.13\/hls.min.js"><\/script>');
+}
+</script>
+<script>
+const $ = s => document.querySelector(s);
+const v = $("#v"), veil = $("#veil");
+let hls = null, mode = "live", day = null, sel = null;
+
+/* ---- live ---------------------------------------------------------- */
+function playLive(){
+  mode = "live"; sel = null; v.muted = true;
+  $("#capLeft").textContent = "LIVE";
+  const src = "/live/live.m3u8";
+  if (hls) { hls.destroy(); hls = null; }
+  if (v.canPlayType("application/vnd.apple.mpegurl")) {
+    v.src = src;                       // iOS Safari plays HLS natively
+  } else if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 2, maxBufferLength: 8 });
+    hls.loadSource(src); hls.attachMedia(v);
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) setTimeout(playLive, 3000); });
+  } else {
+    $("#veilHint").textContent = "이 브라우저는 HLS 재생을 지원하지 않아";
+  }
+  v.play().catch(()=>{});
+}
+
+function playClip(name, label, btn){
+  mode = "clip"; v.muted = false;
+  if (hls) { hls.destroy(); hls = null; }
+  v.src = "/clips/" + name;
+  $("#capLeft").textContent = label;
+  v.play().catch(()=>{});
+  document.querySelectorAll(".sel").forEach(e => e.classList.remove("sel"));
+  if (btn) btn.classList.add("sel");
+  document.querySelectorAll('.tick[data-n="'+name+'"],.row[data-n="'+name+'"]')
+          .forEach(e => e.classList.add("sel"));
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+v.addEventListener("playing", () => veil.hidden = true);
+v.addEventListener("error",   () => { if (mode === "live") veil.hidden = false; });
+v.addEventListener("waiting", () => { if (mode === "live") veil.hidden = false; });
+
+/* ---- status -------------------------------------------------------- */
+const hms = s => [s/3600, s/60%60, s%60].map(n => String(Math.floor(n)).padStart(2,"0")).join(":");
+
+async function status(){
+  try{
+    const s = await (await fetch("/api/status")).json();
+    $("#chan").textContent = s.channel;
+    const t = $("#tally");
+    t.classList.toggle("on", s.recording);
+    $("#tallyText").textContent = s.recording ? "녹화 중" : "정지됨";
+    $("#clock").textContent = s.server_time.slice(11);
+    $("#capRight").textContent = s.server_time.slice(0,10).replaceAll("-","."); 
+    $("#mUp").textContent  = s.recording ? hms(s.uptime) : "—";
+    $("#mRe").textContent  = s.restarts;
+    $("#mDisk").textContent = s.used_gb + " / " + s.max_gb + " GB";
+    $("#mBar").style.width = Math.min(100, s.used_gb / s.max_gb * 100) + "%";
+    $("#mKeep").textContent = s.retain_days + "일";
+    if (!s.recording && s.last_error) $("#veilHint").textContent = s.last_error;
+  }catch(e){ $("#tallyText").textContent = "서버 응답 없음"; }
+}
+
+/* ---- archive ------------------------------------------------------- */
+async function loadDays(){
+  const { days } = await (await fetch("/api/days")).json();
+  const box = $("#days"); box.innerHTML = "";
+  if (!days.length){ $("#rows").innerHTML = '<p class="empty">아직 저장된 기록이 없어</p>'; return; }
+  day = day && days.includes(day) ? day : days[0];
+  days.forEach(d => {
+    const b = document.createElement("button");
+    b.textContent = d.slice(5).replace("-", ".");
+    b.setAttribute("aria-pressed", d === day);
+    b.onclick = () => { day = d; loadDays(); };
+    box.appendChild(b);
+  });
+  loadClips();
+}
+
+async function loadClips(){
+  const { clips } = await (await fetch("/api/clips?date=" + day)).json();
+  const strip = $("#strip"), rows = $("#rows");
+  strip.innerHTML = ""; rows.innerHTML = "";
+  for (let h = 6; h < 24; h += 6){
+    const g = document.createElement("div");
+    g.className = "hour"; g.style.left = (h / 24 * 100) + "%";
+    strip.appendChild(g);
+  }
+  if (!clips.length){ rows.innerHTML = '<p class="empty">이 날짜에는 기록이 없어</p>'; return; }
+
+  clips.forEach(c => {
+    const t = document.createElement("button");
+    t.className = "tick"; t.dataset.n = c.name;
+    t.style.left = (c.seconds_of_day / 86400 * 100) + "%";
+    t.style.width = "0.7%";
+    t.title = c.time;
+    t.setAttribute("aria-label", c.time + " 재생");
+    t.onclick = () => playClip(c.name, c.date + " " + c.time, t);
+    strip.appendChild(t);
+
+    const r = document.createElement("button");
+    r.className = "row"; r.dataset.n = c.name;
+    r.innerHTML = `<time>${c.time}</time><span class="mb">${c.size_mb} MB</span>`;
+    r.onclick = () => playClip(c.name, c.date + " " + c.time, r);
+    rows.appendChild(r);
+  });
+}
+
+/* ---- tabs ---------------------------------------------------------- */
+$("#tabLive").onclick = () => {
+  $("#tabLive").setAttribute("aria-selected","true");
+  $("#tabArch").setAttribute("aria-selected","false");
+  $("#paneLive").hidden = false; $("#paneArch").hidden = true;
+  playLive();
+};
+$("#tabArch").onclick = () => {
+  $("#tabArch").setAttribute("aria-selected","true");
+  $("#tabLive").setAttribute("aria-selected","false");
+  $("#paneArch").hidden = false; $("#paneLive").hidden = true;
+  loadDays();
+};
+
+status(); setInterval(status, 5000);
+playLive();
+</script>
+</body>
+</html>

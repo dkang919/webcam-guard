@@ -1,0 +1,20 @@
+# 에디터 간 공백/줄바꿈 규약. guard.py 는 PEP8 4-space.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{html,css,js,json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+# 배치 파일은 CRLF 여야 cmd.exe 가 안전하게 읽는다.
+[*.bat]
+end_of_line = crlf

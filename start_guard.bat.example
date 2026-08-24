@@ -1,0 +1,39 @@
+@echo off
+chcp 65001 >nul
+REM ===================================================================
+REM  이 파일을 복사해서 start_guard.bat 으로 저장한 뒤
+REM  DEVICE 와 GUARD_PASSWORD 두 줄만 네 값으로 바꿔.
+REM
+REM  DEVICE : python guard.py --list 에서 나온 따옴표 안 이름 그대로
+REM  GUARD_PASSWORD : 뷰어 접속 비밀번호 (아이디는 admin)
+REM
+REM  start_guard.bat 은 비밀번호가 들어가므로 .gitignore 에 있다.
+REM  자동 실행: Win+R -> shell:startup -> 이 .bat 의 바로가기를 넣기
+REM ===================================================================
+setlocal
+
+set "DEVICE=HD Pro Webcam C920"
+set "ROOT=C:\CamRecordings"
+set "PORT=8088"
+
+REM 비밀번호는 인자가 아니라 환경변수로 넘긴다. --password 로 주면
+REM 작업 관리자의 "명령줄" 열에 그대로 보인다. setlocal 안이라 이 창
+REM 밖으로는 새어나가지 않는다.
+set "GUARD_PASSWORD=changeme"
+
+cd /d "%~dp0"
+title Guard - %DEVICE%
+
+REM guard.py 자체가 죽는 경우(파이썬 예외)를 대비한 바깥쪽 재시작 루프.
+REM ffmpeg 이 죽는 건 guard.py 안의 워치독이 이미 처리한다.
+REM
+REM 주의: guard.py 를 작업 관리자로 강제 종료하면 ffmpeg 이 고아로 남아
+REM 카메라를 계속 붙잡는다. 그 상태에서는 재시작해도 카메라를 못 열어서
+REM 이 루프가 헛돈다. 그럴 땐 아래를 한 번 실행하고 다시 켜:
+REM     taskkill /F /IM ffmpeg.exe
+:loop
+python guard.py --device "%DEVICE%" --root "%ROOT%" --port %PORT%
+echo.
+echo [start_guard] guard.py 가 종료됐어. 10초 뒤 재시작한다. 완전히 끄려면 이 창을 닫아.
+timeout /t 10 /nobreak >nul
+goto loop

@@ -1,0 +1,31 @@
+# --- 절대 커밋하면 안 되는 것 -------------------------------------------
+# 녹화물. 용량도 크고 사생활 그 자체다.
+/CamRecordings/
+*.mp4
+*.ts
+*.m3u8
+
+# 실행용 배치 파일에는 뷰어 비밀번호가 들어간다.
+# 배포용 템플릿은 start_guard.bat.example 쪽이다.
+start_guard.bat
+guard.local.*
+*.secret
+
+# GUARD_PASSWORD 등 비밀값. 절대 커밋 금지.
+.env
+.env.*
+!.env.example
+
+# --- 개발 부산물 ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+_scratch/
+*.log
+
+# --- 에디터 / OS ---------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
