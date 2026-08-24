@@ -30,11 +30,13 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import REPO, import_guard, make_cfg, prepare_root, have_ffmpeg, seed_clips
+from _common import (REPO, import_guard, make_cfg, prepare_root, have_ffmpeg,
+                     seed_clips, seed_events)
 
 guard = import_guard()
 
@@ -145,6 +147,106 @@ def test_config(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 0b. logbook: scoring and storage (no camera, no ffmpeg)
+# ---------------------------------------------------------------------------
+def test_logbook(tmp: Path) -> None:
+    w, h = guard.MOTION_W, guard.MOTION_H
+    n = w * h
+    still = bytes([100]) * n
+    grain = bytes(100 + (i % 3) for i in range(n))
+    half = bytes(200 if i < n // 2 else 100 for i in range(n))
+    # Derived from the setting, not hardcoded: the smallest subject that is
+    # supposed to be logged, so this test still means something if the default
+    # threshold changes.
+    need = int(n * guard.DEFAULTS["motion_threshold"] / 100) + 1
+    speck = bytes(200 if i < need else 100 for i in range(n))
+
+    check("identical frames score 0", guard.motion_score([still, still]) == 0.0)
+    check("sub-threshold grain is ignored",
+          guard.motion_score([still, grain]) == 0.0,
+          f"got {guard.motion_score([still, grain])}")
+    check("half the frame changing scores ~50",
+          49 <= guard.motion_score([still, half]) <= 51,
+          f"got {guard.motion_score([still, half])}")
+    check(f"the smallest intended subject ({need} px) clears the threshold",
+          guard.motion_score([still, speck]) >= guard.DEFAULTS["motion_threshold"],
+          f"got {guard.motion_score([still, speck])}")
+    check("score is the worst pair, not the average",
+          guard.motion_score([still, half, still]) > 40)
+    check("a single frame cannot score", guard.motion_score([still]) == 0.0)
+
+    # storage round-trip
+    events = tmp / "events"
+    events.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    guard.write_event(events, {"start": now, "last": now + 42,
+                               "score": 12.34, "faces": 2})
+    guard.write_event(events, {"start": now, "last": now, "score": 3.0, "faces": 0})
+    day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    rows = guard.read_events(events, day)
+    check("write_event appends one JSON line per event", len(rows) == 2,
+          f"got {len(rows)}")
+    check("faces > 0 is recorded as a face event",
+          rows[0]["kind"] == "face" and rows[0]["faces"] == 2
+          and rows[0]["duration"] == 42, f"got {rows[0]}")
+    check("no faces is recorded as motion", rows[1]["kind"] == "motion")
+    check("seconds_of_day matches the start time",
+          rows[0]["seconds_of_day"] == datetime.fromtimestamp(now).hour * 3600
+          + datetime.fromtimestamp(now).minute * 60
+          + datetime.fromtimestamp(now).second)
+
+    # a crash mid-append leaves half a line; it must not poison the whole day
+    with (events / f"{day}.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"start": "10:00:00", "en')
+    check("a half-written line is skipped, not fatal",
+          len(guard.read_events(events, day)) == 2)
+    check("unknown date returns nothing", guard.read_events(events, "1999-01-01") == [])
+    check("a non-date is rejected before touching disk",
+          guard.read_events(events, "../../guard.py") == [])
+
+    # OpenCV is optional by design
+    det = guard.load_face_detector()
+    if det is None:
+        check("no OpenCV -> count_faces reports -1, no crash",
+              guard.count_faces(make_cfg(), tmp / "nope.ts") == -1)
+    else:
+        check("OpenCV present -> detector loaded", len(det) == 3)
+
+
+def test_logbook_pipeline(root: Path) -> None:
+    """Score real encoded video: a still scene must stay quiet, a moving one not.
+
+    The still scene carries the burnt-in clock, because a repainting timestamp
+    is the one thing guaranteed to change in an empty room.
+    """
+    cfg = make_cfg(size="640x360", fps=10)
+    scenes = {
+        "still room with clock": "color=c=gray:s=640x360:r=10",
+        "moving subject": "testsrc=s=640x360:r=10",
+    }
+    scored = {}
+    for label, src in scenes.items():
+        out = root / (label.split()[0] + ".ts")
+        cmd = [cfg.ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", src, "-t", "3"]
+        cmd += guard.timestamp_filter(cfg)
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-f", "mpegts", str(out)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        frames = guard.sample_frames(cfg, out, guard.MOTION_W, guard.MOTION_H,
+                                     guard.MOTION_FPS)
+        scored[label] = guard.motion_score(frames) if len(frames) >= 2 else -1.0
+
+    thr = cfg.motion_threshold
+    check(f"still room stays under the threshold ({scored['still room with clock']:.2f}%)",
+          0 <= scored["still room with clock"] < thr)
+    check(f"the burnt-in clock alone is not motion",
+          scored["still room with clock"] < thr,
+          "a repainting timestamp must not fill the logbook in an empty room")
+    check(f"moving subject clears the threshold ({scored['moving subject']:.2f}%)",
+          scored["moving subject"] >= thr)
+
+
+# ---------------------------------------------------------------------------
 # 1b. orphan protection (Windows)
 # ---------------------------------------------------------------------------
 def pid_alive(pid: int) -> bool:
@@ -226,6 +328,7 @@ class Client:
 def test_http(root: Path) -> None:
     cfg = make_cfg(device="SELFTEST", password="selftest-pw", port=0)
     n = seed_clips(root / "clips", days=1)
+    seed_events(root / "events", days=1)
     (root / "live" / "live.m3u8").write_text("#EXTM3U\n#EXT-X-VERSION:3\n")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), guard.make_handler(cfg, root, REPO))
@@ -368,10 +471,14 @@ def main():
     try:
         print("\n[config]    .env parsing and the precedence chain")
         test_config(prepare_root(tmp / "cfg"))
+        print("\n[logbook]   motion scoring, event storage, face detector")
+        test_logbook(prepare_root(tmp / "log"))
         if run_pipe:
             if have_ffmpeg():
                 print("\n[pipeline]  lavfi testsrc -> tee -> segment + hls")
                 test_pipeline(prepare_root(tmp / "pipe"), timestamp)
+                print("\n[motion]    still scene vs moving scene, real encoding")
+                test_logbook_pipeline(prepare_root(tmp / "motion"))
                 if sys.platform == "win32":
                     print("\n[orphan]    hard-kill the parent, child must die too")
                     test_orphan_kill()
