@@ -85,12 +85,44 @@
   /* ---- signature: 24h strip ----------------------------------------- */
   .strip{position:relative;height:52px;background:var(--panel);border:1px solid var(--line);margin-bottom:6px}
   .strip .hour{position:absolute;top:0;bottom:0;width:1px;background:var(--line)}
+  /* two lanes: recordings on top, detections underneath. Same hue throughout -
+     weight carries the meaning, so no new colour enters the palette. */
   .tick{
-    position:absolute;top:9px;bottom:9px;min-width:3px;padding:0;border:0;cursor:pointer;
-    background:rgba(242,167,59,.5);
+    position:absolute;top:8px;height:15px;min-width:3px;padding:0;border:0;cursor:pointer;
+    background:rgba(242,167,59,.32);
   }
   .tick:hover,.tick.sel{background:var(--sodium)}
-  .scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.08em;margin-bottom:22px}
+  .evt{
+    position:absolute;bottom:8px;height:15px;min-width:2px;padding:0;border:0;cursor:pointer;
+    background:rgba(242,167,59,.55);
+  }
+  .evt.face{background:var(--sodium)}
+  .evt:hover,.evt.sel{outline:1px solid var(--bone);outline-offset:1px}
+  .scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.08em}
+  .legend{
+    display:flex;gap:16px;margin:8px 0 20px;
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase;
+  }
+  .legend i{display:inline-block;width:14px;height:7px;margin-right:5px;vertical-align:middle;font-style:normal}
+  .legend .r{background:rgba(242,167,59,.32)}
+  .legend .m{background:rgba(242,167,59,.55)}
+  .legend .f{background:var(--sodium)}
+
+  /* ---- logbook ------------------------------------------------------ */
+  .lbh{
+    font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--dim);margin:22px 0 2px;font-weight:600;
+  }
+  .ev{
+    display:flex;align-items:center;gap:12px;width:100%;text-align:left;cursor:pointer;
+    background:none;border:0;border-bottom:1px solid var(--line);padding:11px 4px;color:var(--bone);
+  }
+  .ev:hover{background:var(--panel)}
+  .ev.sel{background:var(--panel);box-shadow:inset 3px 0 0 var(--sodium)}
+  .ev time{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums;letter-spacing:.04em}
+  .ev .what{font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
+  .ev .what.face{color:var(--sodium)}
+  .ev .dur{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--dim)}
 
   /* ---- clip rows ---------------------------------------------------- */
   .row{
@@ -135,6 +167,7 @@
         <div class="bar"><span id="mBar" style="width:0"></span></div>
       </div>
       <div class="meter"><dt>보관 기간</dt><dd id="mKeep">—</dd></div>
+      <div class="meter"><dt>오늘 감지</dt><dd id="mEv">—</dd></div>
     </dl>
   </section>
 
@@ -142,6 +175,13 @@
     <div class="days" id="days"></div>
     <div class="strip" id="strip"></div>
     <div class="scale"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+    <p class="legend">
+      <span><i class="r"></i>녹화</span>
+      <span><i class="m"></i>움직임</span>
+      <span><i class="f"></i>얼굴</span>
+    </p>
+    <div id="logbook"></div>
+    <p class="lbh">전체 기록</p>
     <div id="rows"></div>
   </section>
 
@@ -160,6 +200,11 @@ if (!window.Hls) {
 const $ = s => document.querySelector(s);
 const v = $("#v"), veil = $("#veil");
 let hls = null, mode = "live", day = null, sel = null;
+// Bumped on every archive render. loadEvents() fetches asynchronously and
+// then appends to the strip, so without this a second render (tapping two
+// day chips quickly) lets a stale response paint its marks on top of the
+// new ones - the timeline ends up with two sets of events.
+let renderSeq = 0;
 
 /* ---- live ---------------------------------------------------------- */
 function playLive(){
@@ -179,10 +224,15 @@ function playLive(){
   v.play().catch(()=>{});
 }
 
-function playClip(name, label, btn){
+function playClip(name, label, btn, offset){
   mode = "clip"; v.muted = false;
   if (hls) { hls.destroy(); hls = null; }
   v.src = "/clips/" + name;
+  // Jump to the moment the logbook points at. Done on loadedmetadata rather
+  // than with a #t= fragment because seeking before the duration is known is
+  // silently ignored on some browsers.
+  if (offset > 0) v.addEventListener("loadedmetadata",
+                                     () => { v.currentTime = offset; }, { once: true });
   $("#capLeft").textContent = label;
   v.play().catch(()=>{});
   document.querySelectorAll(".sel").forEach(e => e.classList.remove("sel"));
@@ -213,6 +263,8 @@ async function status(){
     $("#mDisk").textContent = s.used_gb + " / " + s.max_gb + " GB";
     $("#mBar").style.width = Math.min(100, s.used_gb / s.max_gb * 100) + "%";
     $("#mKeep").textContent = s.retain_days + "일";
+    $("#mEv").textContent = !s.logbook ? "꾼" :
+      (s.events_today + (s.faces_available ? "" : " (모션)"));
     if (!s.recording && s.last_error) $("#veilHint").textContent = s.last_error;
   }catch(e){ $("#tallyText").textContent = "서버 응답 없음"; }
 }
@@ -234,7 +286,9 @@ async function loadDays(){
 }
 
 async function loadClips(){
+  const seq = ++renderSeq;
   const { clips } = await (await fetch("/api/clips?date=" + day)).json();
+  if (seq !== renderSeq) return;
   const strip = $("#strip"), rows = $("#rows");
   strip.innerHTML = ""; rows.innerHTML = "";
   for (let h = 6; h < 24; h += 6){
@@ -242,7 +296,10 @@ async function loadClips(){
     g.className = "hour"; g.style.left = (h / 24 * 100) + "%";
     strip.appendChild(g);
   }
-  if (!clips.length){ rows.innerHTML = '<p class="empty">이 날짜에는 기록이 없어</p>'; return; }
+  if (!clips.length){
+    rows.innerHTML = '<p class="empty">이 날짜에는 기록이 없어</p>';
+    return loadEvents(seq);  // the logbook outlives clips the janitor removed
+  }
 
   clips.forEach(c => {
     const t = document.createElement("button");
@@ -260,6 +317,60 @@ async function loadClips(){
     r.onclick = () => playClip(c.name, c.date + " " + c.time, r);
     rows.appendChild(r);
   });
+  await loadEvents(seq);
+}
+
+/* ---- logbook ------------------------------------------------------- */
+async function loadEvents(seq){
+  const box = $("#logbook"), strip = $("#strip");
+  let events = [];
+  try {
+    events = (await (await fetch("/api/events?date=" + day)).json()).events || [];
+  } catch (e) { box.innerHTML = ""; return; }
+  if (seq !== renderSeq) return;   // a newer render already owns the strip
+
+  box.innerHTML = '<p class="lbh">로그북 · ' + events.length + '건</p>';
+  if (!events.length){
+    box.innerHTML += '<p class="empty">이 날짜에는 움직임도 얼굴도 없었어</p>';
+    return;
+  }
+
+  events.forEach(e => {
+    const face = e.kind === "face";
+    const what = face ? ("얼굴 " + e.faces) : "움직임";
+    const label = e.start + "–" + e.end + " " + what;
+
+    // lower lane of the 24h strip
+    const mark = document.createElement("button");
+    mark.className = "evt" + (face ? " face" : "");
+    mark.dataset.ev = e.start;
+    mark.style.left = (e.seconds_of_day / 86400 * 100) + "%";
+    mark.style.width = Math.max(0.25, e.duration / 86400 * 100) + "%";
+    mark.title = label;
+    mark.setAttribute("aria-label", label + " 재생");
+    strip.appendChild(mark);
+
+    const row = document.createElement("button");
+    row.className = "ev";
+    row.dataset.ev = e.start;
+    row.innerHTML = `<time>${e.start}</time>`
+                  + `<span class="what${face ? " face" : ""}">${what}</span>`
+                  + `<span class="dur">${e.duration}초</span>`;
+    box.appendChild(row);
+
+    const go = el => e.clip
+      ? playClipAt(e, el)
+      : ($("#veilHint").textContent = "이 시각의 클립이 아직 없어");
+    mark.onclick = () => go(mark);
+    row.onclick = () => go(row);
+  });
+}
+
+function playClipAt(e, el){
+  playClip(e.clip, e.start + " " + (e.kind === "face" ? "얼굴" : "움직임"),
+           el, e.offset);
+  document.querySelectorAll('[data-ev="' + e.start + '"]')
+          .forEach(x => x.classList.add("sel"));
 }
 
 /* ---- tabs ---------------------------------------------------------- */

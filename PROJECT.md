@@ -14,9 +14,11 @@
 |---|---|
 | 실행 환경 | **Windows PC** (사용자 본인 PC, 상시 켜둠) |
 | 구현 방식 | **직접 코딩** (Frigate·motionEye 같은 기성품을 의도적으로 쓰지 않음) |
-| 필수 기능 | ① 24시간 상시 녹화 ② 휴대폰에서 실시간 보기 ③ 오래된 영상 자동 삭제 |
-| 제외한 기능 | 모션 감지, 오디오 녹음, 얼굴/객체 인식, 알림 |
-| 의존성 | ffmpeg(외부 실행 파일) + Python 표준 라이브러리만. **pip 패키지 0개** |
+| 필수 기능 | ① 24시간 상시 녹화 ② 휴대폰에서 실시간 보기 ③ 오래된 영상 자동 삭제 ④ 움직임·얼굴 로그북 |
+| 제외한 기능 | 오디오 녹음, 알림/푸시, **신원을 식별하는** 얼굴 인식, 클라우드 업로드 |
+| 의존성 | ffmpeg(외부 실행 파일) + Python 표준 라이브러리만. **pip 패키지 0개**. OpenCV는 있으면 얼굴 감지에 쓰고 없으면 그냥 건너뛴다 |
+
+④는 나중에 추가됐다. 장시간 운영에서는 **대부분의 시간에 아무 일도 없다**는 게 이유다. 상시 녹화는 유지하되 볼 곳을 찾아주는 색인이 필요했다. 설계 근거는 5-12~15절.
 
 사용자는 한국어로 소통하며, 설명에 **"왜(Why)"를 함께 요구**한다. 코드 주석은 영어, 사용자 대면 텍스트(UI·README)는 한국어로 통일되어 있다.
 
@@ -38,7 +40,7 @@
 - 실측 용량: 720p·15fps·1500k에서 **하루 15.4GB** (1080p·15fps·2500k는 26.3GB).
 - **라이브 파일 경합** — 실제 카메라 + 동시 12스레드 45초 부하로 재현하고 수정했다 (5-11절). 수정 후 서버 예외 0건, keep-alive 78242회 요청 전부 정상.
 
-**전부 `python tools/selftest.py` 한 줄로 재현된다. 37개 항목 통과.** 손으로 curl 치지 말 것.
+**전부 `python tools/selftest.py` 한 줄로 재현된다. 54개 항목 통과.** 손으로 curl 치지 말 것.
 
 ### ❌ 아직 검증 안 됨
 
@@ -63,8 +65,12 @@ USB웹캠 │  [supervisor thread] ── subprocess ──> ffmpeg.exe         
         │                        ▼                                     ▼   │
         │           clips/YYYY-MM-DD_HH-MM-SS.mp4          live/live.m3u8  │
         │           (10분 단위 아카이브)                     live/segN.ts    │
-        │                        │                                     │   │
-        │  [janitor thread] ─────┘ 용량·기한 초과분 삭제                  │   │
+        │                        │                             │        │   │
+        │  [janitor thread] ─────┘ 용량·기한 초과분 삭제         │        │   │
+        │                                                      │        │   │
+        │  [analyzer thread] ────────────── 완성된 세그먼트를 읽어 ┘        │   │
+        │        │  모션(변한 픽셀 %) + 얼굴(OpenCV, 선택)                  │   │
+        │        └──> events/YYYY-MM-DD.jsonl  (사건 구간 단위로 병합)      │   │
         │                                                              │   │
         │  [ThreadingHTTPServer :8088] ── Basic Auth ──────────────────┘   │
         │        └─> index.html (뷰어) + JSON API + 파일 서빙                │
@@ -79,7 +85,8 @@ USB웹캠 │  [supervisor thread] ── subprocess ──> ffmpeg.exe         
 그래서 "녹화용 ffmpeg 하나 + 스트리밍용 ffmpeg 하나"는 **불가능**하다. 반드시 ffmpeg 프로세스 **하나**가 카메라를 잡고, 그 안에서 `tee` 먹서로 출력을 둘로 나눠야 한다. 인코딩도 한 번만 일어나므로 CPU도 절약된다.
 
 이 제약 때문에 다음이 자동으로 따라온다:
-- 모션 감지든 뭐든 **새 기능은 반드시 기존 ffmpeg 파이프라인 안에** 넣어야 한다 (예: `select` 필터, 또는 tee에 세 번째 출력 추가).
+- 카메라가 필요한 새 기능은 **기존 ffmpeg 파이프라인 안에** 넣어야 한다 (예: `select` 필터, 또는 tee에 세 번째 출력 추가).
+- 반면 **이미 기록된 파일을 읽는 건 자유롭다.** 로그북이 바로 그 방식이다 (5-12절).
 - 카메라를 다시 열려고 시도하는 코드를 추가하면 즉시 깨진다.
 
 ---
@@ -105,11 +112,13 @@ webcam-guard\                  # 레포. 배포 위치는 어디든 상관없다
       ├─ _common.py            #   DEFAULTS 재사용, 가짜 클립 생성
       ├─ selftest.py           #   카메라 없이 파이프라인 + 전 라우트 검증
       ├─ devserver.py          #   가짜 카메라로 실제 앱 구동 (뷰어 작업용)
-      └─ vendor.py             #   static/ 자산 받아오기 (빌드 단계, 1회성)
+      ├─ vendor.py             #   static/ 자산 받아오기 (빌드 단계, 1회성)
+      └─ calibrate.py          #   방에 맞는 motion_threshold 찾기
 
 C:\CamRecordings\  # --root, 실행 시 자동 생성
   ├─ clips\        # 10분짜리 mp4 아카이브
-  └─ live\         # HLS 임시 파일 (delete_segments로 계속 순환)
+  ├─ live\         # HLS 임시 파일 (delete_segments로 계속 순환)
+  └─ events\       # 로그북. 날짜별 JSON Lines
 ```
 
 `guard.py`와 `index.html`은 **같은 폴더**에 있어야 한다 (`main()`에서 검사 후 없으면 종료).
@@ -120,7 +129,7 @@ C:\CamRecordings\  # --root, 실행 시 자동 생성
 |---|---|
 | `DEFAULTS` | 모든 설정의 단일 출처. argparse가 이 dict를 순회해 CLI 플래그를 자동 생성 |
 | `load_dotenv()` / `env_default()` | 설정 우선순위 **CLI 인자 > 환경변수(.env) > DEFAULTS** (5-10절) |
-| `STATE` | 스레드 간 공유 상태 (recording, started_at, restarts, last_error) |
+| `STATE` | 스레드 간 공유 상태 (recording, started_at, restarts, last_error, events_today, last_event) |
 | `CLIP_RE` | 파일명 규약 정규식. **파싱·검증·경로차단 3곳에서 재사용** |
 | `STATIC_RE` | `/static/` 화이트리스트. 확장자가 js/css/woff2 인 평범한 이름만 통과 |
 | `find_font()` / `timestamp_filter()` | 시각 오버레이. 폰트가 없거나 못 쓰면 **필터를 빼고 녹화는 계속한다** |
@@ -130,8 +139,11 @@ C:\CamRecordings\  # --root, 실행 시 자동 생성
 | `_job_handle()` / `adopt_child()` | ffmpeg을 Windows Job Object에 묶어 고아를 막는다 (5-9절) |
 | `supervisor()` | ffmpeg 생명주기 관리 (스레드) |
 | `janitor()` | 디스크 정리, 5분 주기 (스레드) |
+| `analyzer()` | 로그북. 2초마다 새 세그먼트를 보고 사건을 병합해 기록 (스레드, 5-12~15절) |
+| `motion_score()` | 변한 픽셀의 **비율**. 평균 밝기차로 바꾸지 말 것 (5-13절) |
+| `load_face_detector()` / `count_faces()` | OpenCV 선택 사용. 없으면 `-1` (5-14절) |
 | `make_handler()` | 클로저로 설정을 캡처해 HTTP 핸들러 클래스 생성 |
-| `main()` | 폴더 준비 → 스레드 2개 기동 → HTTP 서버 blocking |
+| `main()` | 폴더 준비 → 스레드 3개 기동(supervisor·janitor·analyzer) → HTTP 서버 blocking |
 
 ---
 
@@ -241,6 +253,51 @@ return self.send_live(live_dir / name, ctype)   # send_file 이 아니다
 
 측정: 실제 C920 + 동시 12스레드 45초 부하에서 수정 전 서버 예외 1건, 수정 후 0건. keep-alive(실제 플레이어 방식)로는 78242회 요청 전부 정상.
 
+### 5-12. 로그북은 **HLS 세그먼트**를 읽는다 — 카메라도 클립도 아니다
+
+**Why 세그먼트인가**: 선택지가 셋뿐인데 나머지 둘이 막혀 있다.
+
+| 후보 | 왜 안 되나 |
+|---|---|
+| 카메라를 다시 연다 | **불가능.** Windows에서 웹캠은 한 프로세스만 점유한다 (3절) |
+| 10분짜리 클립을 분석 | 지연 10분 + 10분치 영상을 한 번에 디코드 |
+| **`live/seg*.ts`** | 2초마다 생기고 디코드가 싸다. **채택** |
+
+파일을 읽는 것은 "ffmpeg 프로세스 하나" 규칙과 무관하다. 그 규칙은 **카메라를 누가 쥐느냐**의 문제지 ffmpeg을 몇 번 실행하느냐가 아니다. 분석용 ffmpeg은 디스크의 완성된 파일만 건드린다.
+
+`janitor`처럼 **가장 최신 세그먼트는 건드리지 않는다**(`segs[:-1]`). ffmpeg이 아직 쓰는 중이다.
+
+### 5-13. 모션 지표는 "평균 밝기차"가 아니라 **변한 픽셀의 비율**이다
+
+```python
+changed = sum(1 for x, y in zip(a, b) if abs(x - y) > PIXEL_NOISE)
+worst = max(worst, changed * 100.0 / len(a))
+```
+
+**Why**: 처음엔 평균 절대차로 만들었다가 실측에서 틀렸다는 게 드러났다. **화면 전체가 움직이는 테스트 패턴조차 4.23밖에 안 나와서**, 임계값 6.0으로는 사람이 지나가도 아무것도 기록되지 않았다. 평균은 작은 피사체를 희석시킨다.
+
+변한 픽셀 비율은 세 가지를 동시에 해결한다 — ① 화면의 3%를 차지하는 사람이 그대로 3%로 잡힌다 ② 픽셀마다 `PIXEL_NOISE`만큼 움직여야 세므로 센서 노이즈를 무시한다 ③ 전체 밝기가 서서히 변해도 흔들리지 않는다. 값이 "화면의 몇 %"라 사용자가 튜닝하기도 쉽다.
+
+**실측(C920)**: 빈 방 **0.00%**, 사람 움직임 8~90%. 바닥이 진짜 0인 이유는 64×36으로 줄이면 한 픽셀이 원본 20×20을 평균내서 노이즈가 지워지기 때문이다.
+
+> 참고로 **화면에 찍히는 시계는 모션으로 잡히지 않는다.** 처음엔 그럴 거라 보고 하단을 잘라냈는데, 실측하니 64×36에서는 글자가 뭉개져 크롭 없이도 0.00이었다. 크롭은 폰트 크기나 해상도를 키웠을 때를 대비해 남겨뒀다. selftest가 이걸 계속 확인한다.
+
+### 5-14. 얼굴 감지는 **선택 사항**이고 모션과 독립이다
+
+**Why 선택 사항인가**: ffmpeg에는 얼굴 감지가 없다. `dnn_detect` 필터는 OpenVINO/TensorFlow 백엔드를 넣어 빌드해야 하는데 일반 배포판(Gyan 포함)에는 없다 — 확인했다. 그래서 OpenCV를 쓰되, **없으면 `count_faces()`가 `-1`을 돌려주고 모션만 기록한 채 계속 돈다.** `guard.py`의 "pip 0개" 약속은 유지된다.
+
+**Why 모션과 독립인가**: 처음엔 "모션이 잡혔을 때만 얼굴 검사"로 CPU를 아끼려 했는데, **가만히 앉아 있는 사람을 통째로 놓친다.** 실측 비용이 2초당 78ms(코어의 4%)라 항상 돌려도 감당된다. 사건 발생 조건은 `모션 ≥ 임계값 OR 얼굴 > 0`이다.
+
+`faces`가 `-1`일 수 있으므로 비교는 반드시 `faces > 0` / `faces <= 0`으로 할 것. `if faces:`로 바꾸면 OpenCV가 없을 때 `-1`이 참이 되어 전부 얼굴 사건이 된다.
+
+### 5-15. 사건은 **구간으로 병합**해서 저장한다
+
+**Why**: 세그먼트마다 한 줄씩 쓰면 사람이 1분만 있어도 30줄이 쌓여 로그북이 읽을 수 없게 된다. `event_gap`(기본 10초) 동안 조용하면 사건을 닫고 한 줄로 적는다 — `10:39:12–10:39:48, 얼굴 1, 36초`.
+
+저장은 날짜별 **JSON Lines**(`events/YYYY-MM-DD.jsonl`). 덧붙이기만 하므로 쓰다 죽어도 한 줄만 잃고, 아무 편집기로나 열리고, DB가 필요 없다. `read_events()`는 깨진 줄을 건너뛴다.
+
+**클립 연결은 저장 시점이 아니라 읽는 시점에** 한다(`/api/events`). 사건이 일어난 순간 그 클립은 아직 녹화 중이고, 나중에 `segment_seconds`가 바뀌어도 답이 맞아야 하기 때문이다.
+
 ---
 
 ## 6. HTTP API 계약
@@ -255,6 +312,8 @@ return self.send_live(live_dir / name, ctype)   # send_file 이 아니다
 | GET | `/api/clips?date=YYYY-MM-DD` | `{clips: [{name, date, time, seconds_of_day, size_mb}]}` |
 | GET | `/live/live.m3u8`, `/live/segN.ts` | HLS (no-store) |
 | GET | `/clips/<name>.mp4` | mp4, **Range 지원**(206) |
+| GET | `/api/events?date=YYYY-MM-DD` | `{events: [{start, end, seconds_of_day, duration, kind, faces, score, clip, offset}]}` |
+| GET | `/api/event-days` | `{days: [...]}` 로그북이 있는 날짜 |
 | GET | `/static/<name>.{js,css,woff2}` | 내장 자산 (`private, max-age=604800`) |
 
 `seconds_of_day`는 뷰어의 24시간 타임라인이 눈금 위치를 계산하는 값이다 (`seconds_of_day / 86400 * 100%`).

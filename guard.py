@@ -28,6 +28,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
+# Windows consoles and redirected pipes default to the legacy code page
+# (cp949/cp1252), where the Korean status lines raise UnicodeEncodeError and
+# kill whatever thread printed them - recording included. errors="replace"
+# means the worst case is mojibake, never a crash.
+#
+# At import time, not inside main(): the analyzer thread and everything under
+# tools/ import this module and print through it without going through main().
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 # ----------------------------------------------------------------------------
 # defaults (override with CLI flags)
 # ----------------------------------------------------------------------------
@@ -51,6 +65,15 @@ DEFAULTS = dict(
     input_codec=None,         # try "mjpeg" if fps is low or input fails
     timestamp=True,           # burn clock into the picture
     channel="ROOM 01",
+    # -- logbook ------------------------------------------------------------
+    logbook=True,             # write motion/face events to events/<date>.jsonl
+    # Measured on a real C920: an empty room reads 0.00%, a person moving
+    # reads 8-90%. The floor is genuinely zero because scaling to 64x36
+    # averages away sensor grain, so 1% sits far above noise and still
+    # catches a head-sized subject. tools/calibrate.py retunes per room.
+    motion_threshold=1.0,     # percent of the picture that must change
+    faces=True,               # detect faces on every segment (needs OpenCV)
+    event_gap=10,             # seconds of quiet before an event is closed
 )
 
 STATE = {
@@ -58,6 +81,8 @@ STATE = {
     "started_at": None,
     "restarts": 0,
     "last_error": "",
+    "events_today": 0,
+    "last_event": "",
 }
 
 CLIP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$")
@@ -66,6 +91,16 @@ CLIP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.mp4$")
 # than blacklisting "..", so a name that is not plainly a vendored asset is 404.
 STATIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.(js|css|woff2)$")
 STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2"}
+
+SEG_RE = re.compile(r"^seg(\d+)\.ts$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Motion runs on a thumbnail: 64x36 grey is enough to see that something moved
+# and costs nothing to diff in pure Python. Faces need real detail, so that
+# pass decodes a larger frame - measured at 78ms per 2s segment.
+MOTION_W, MOTION_H, MOTION_FPS = 64, 36, 4
+PIXEL_NOISE = 20          # grey levels one pixel must move to count as changed
+FACE_W, FACE_H, FACE_FPS = 480, 270, 2
 
 
 # ----------------------------------------------------------------------------
@@ -411,6 +446,209 @@ def janitor(cfg, clips_dir: Path, stop: threading.Event) -> None:
 
 
 # ----------------------------------------------------------------------------
+# logbook: motion + faces
+#
+# Why the HLS segments and not the camera or the clips:
+#   - the camera is already held by the recorder and Windows allows exactly one
+#     holder, so re-opening it is impossible (see PROJECT.md 3);
+#   - the 10 minute clips would mean 10 minutes of latency and re-decoding ten
+#     minutes of video at once;
+#   - live/seg*.ts are 2 second files that appear continuously and cost almost
+#     nothing to decode.
+# Reading a finished file off disk is unrelated to the one-process rule, which
+# is about who owns the webcam.
+# ----------------------------------------------------------------------------
+_CV = None   # None = not tried, False = unavailable, tuple = loaded
+
+
+def load_face_detector():
+    """OpenCV + Haar cascade, or None.
+
+    Deliberately optional. guard.py must keep running with zero pip packages,
+    so a missing OpenCV downgrades the logbook to motion-only instead of
+    turning into a startup error.
+    """
+    global _CV
+    if _CV is not None:
+        return _CV or None
+    try:
+        import cv2
+        import numpy
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if cascade.empty():
+            raise RuntimeError("cascade data missing")
+        _CV = (cv2, numpy, cascade)
+        print("[logbook] 얼굴 감지 켜짐 (OpenCV)", flush=True)
+    except Exception as e:
+        print(f"[logbook] 얼굴 감지 꺼짐 — 모션만 기록해 ({e})", flush=True)
+        _CV = False
+    return _CV or None
+
+
+def sample_frames(cfg, path: Path, w: int, h: int, fps: int) -> list:
+    """Decode one segment into raw grayscale frames of w*h bytes.
+
+    The bottom strip is cropped away because the burnt-in clock repaints every
+    second. Without the crop the timestamp alone reads as motion and every
+    single segment would be logged - verified, it fires on an empty room.
+    """
+    cmd = [cfg.ffmpeg, "-v", "error", "-nostdin", "-i", str(path),
+           "-vf", f"crop=iw:ih*0.92:0:0,fps={fps},scale={w}:{h},format=gray",
+           "-f", "rawvideo", "-"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    n = w * h
+    return [out[i:i + n] for i in range(0, len(out) - n + 1, n)]
+
+
+def motion_score(frames) -> float:
+    """Largest percentage of the picture that changed between two frames.
+
+    Counting *changed pixels* instead of averaging the difference is what makes
+    a small subject visible: someone crossing 3% of the frame barely moves the
+    mean brightness, but shows up plainly as 3% of pixels changed. Requiring
+    each pixel to move PIXEL_NOISE levels also ignores sensor grain, and
+    working per-pixel ignores slow brightness drift.
+
+    Measured with a real C920: an empty room sits near 0, a hand waving reads
+    several percent. Max over frame pairs, not average, so a brief movement in
+    one pair is not diluted by the still pairs around it.
+    """
+    worst = 0.0
+    for a, b in zip(frames, frames[1:]):
+        changed = sum(1 for x, y in zip(a, b) if abs(x - y) > PIXEL_NOISE)
+        worst = max(worst, changed * 100.0 / len(a))
+    return worst
+
+
+def count_faces(cfg, path: Path) -> int:
+    """Most faces visible in any sampled frame; -1 when OpenCV is unavailable."""
+    cv = load_face_detector()
+    if cv is None:
+        return -1
+    cv2, numpy, cascade = cv
+    best = 0
+    for raw in sample_frames(cfg, path, FACE_W, FACE_H, FACE_FPS):
+        # .copy() because frombuffer is read-only and OpenCV wants to write
+        img = numpy.frombuffer(raw, dtype=numpy.uint8).reshape(FACE_H, FACE_W).copy()
+        found = cascade.detectMultiScale(img, scaleFactor=1.15, minNeighbors=5,
+                                         minSize=(30, 30))
+        best = max(best, len(found))
+    return best
+
+
+def write_event(events_dir: Path, ev: dict) -> None:
+    """Append one finished event to that day's logbook.
+
+    JSON Lines: append-only, survives a crash mid-write (you lose one line,
+    not the file), readable in any editor, and needs no database. The file is
+    named by date so the viewer can fetch exactly one day.
+    """
+    start = datetime.fromtimestamp(ev["start"])
+    end = datetime.fromtimestamp(ev["last"])
+    rec = {
+        "start": start.strftime("%H:%M:%S"),
+        "end": end.strftime("%H:%M:%S"),
+        "seconds_of_day": start.hour * 3600 + start.minute * 60 + start.second,
+        "duration": max(1, int(ev["last"] - ev["start"])),
+        "kind": "face" if ev["faces"] > 0 else "motion",
+        "faces": ev["faces"],
+        "score": round(ev["score"], 1),
+    }
+    path = events_dir / (start.strftime("%Y-%m-%d") + ".jsonl")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    STATE["events_today"] += 1
+    STATE["last_event"] = f'{rec["start"]} {rec["kind"]}'
+
+
+def analyzer(cfg, root: Path, stop: threading.Event) -> None:
+    """Watch live segments, log motion and faces. Never disturbs recording."""
+    live_dir, events_dir = root / "live", root / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    done, open_ev = set(), None
+
+    while not stop.is_set():
+        try:
+            segs = []
+            for p in live_dir.glob("seg*.ts"):
+                if SEG_RE.match(p.name):
+                    try:
+                        segs.append((p.stat().st_mtime, p))
+                    except OSError:
+                        pass
+            segs.sort()
+
+            # Skip the newest: ffmpeg is still writing it. Same reason the
+            # janitor never touches its last file.
+            for mtime, p in segs[:-1]:
+                key = (p.name, int(mtime))
+                if key in done:
+                    continue
+                done.add(key)
+
+                frames = sample_frames(cfg, p, MOTION_W, MOTION_H, MOTION_FPS)
+                if len(frames) < 2:
+                    continue
+                score = motion_score(frames)
+                # Faces are checked on every segment, not only when motion
+                # fired: someone sitting still is exactly what you want in the
+                # logbook. Measured cost is 78ms per 2s segment (~4% of one
+                # core) on top of 50ms for motion - affordable for a recorder
+                # that is already encoding video around the clock.
+                faces = count_faces(cfg, p) if cfg.faces else 0
+                if score < cfg.motion_threshold and faces <= 0:
+                    continue      # faces is -1 when OpenCV is unavailable
+
+                if open_ev and mtime - open_ev["last"] <= cfg.event_gap:
+                    open_ev["last"] = mtime            # same disturbance
+                    open_ev["score"] = max(open_ev["score"], score)
+                    open_ev["faces"] = max(open_ev["faces"], faces)
+                else:
+                    if open_ev:
+                        write_event(events_dir, open_ev)
+                    open_ev = {"start": mtime, "last": mtime,
+                               "score": score, "faces": faces}
+
+            # Close an event once the room has been quiet long enough.
+            if open_ev and time.time() - open_ev["last"] > cfg.event_gap:
+                write_event(events_dir, open_ev)
+                open_ev = None
+
+            # Bounded: keys for segments that have rotated away are dropped.
+            done &= {(p.name, int(mt)) for mt, p in segs}
+        except Exception as e:      # analysis must never kill recording
+            print("[logbook] error:", e, flush=True)
+        stop.wait(2)
+
+    if open_ev:                     # do not lose the last event on shutdown
+        try:
+            write_event(events_dir, open_ev)
+        except Exception:
+            pass
+
+
+def read_events(events_dir: Path, date: str) -> list:
+    """Parse one day's logbook, skipping any line a crash left half-written."""
+    path = events_dir / f"{date}.jsonl"
+    if not DATE_RE.match(date) or not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+# ----------------------------------------------------------------------------
 # http server
 # ----------------------------------------------------------------------------
 def make_handler(cfg, root: Path, web_dir: Path):
@@ -584,6 +822,11 @@ def make_handler(cfg, root: Path, web_dir: Path):
                     "max_gb": cfg.max_gb,
                     "retain_days": cfg.retain_days,
                     "server_time": datetime.now().isoformat(timespec="seconds"),
+                    "logbook": bool(cfg.logbook),
+                    "faces_available": load_face_detector() is not None
+                                       if cfg.logbook and cfg.faces else False,
+                    "events_today": STATE["events_today"],
+                    "last_event": STATE["last_event"],
                 })
 
             if p == "/api/days":
@@ -611,6 +854,35 @@ def make_handler(cfg, root: Path, web_dir: Path):
                         "size_mb": round(st.st_size / 1024 ** 2, 1),
                     })
                 return self.send_json({"clips": items})
+
+            if p == "/api/events":
+                want = (parse_qs(u.query).get("date") or [""])[0]
+                events = read_events(root / "events", want)
+                # Resolve each event to the clip that contains it, so the
+                # viewer can jump straight to that moment. Done at read time,
+                # not when the event is written: the clip is still being
+                # recorded then, and this way the answer stays right even if
+                # segment_seconds changed between then and now.
+                clips = []
+                for f, _ in clip_files(clips_dir):
+                    m = CLIP_RE.match(f.name)
+                    if m and f"{m.group(1)}-{m.group(2)}-{m.group(3)}" == want:
+                        clips.append((int(m.group(4)) * 3600 + int(m.group(5)) * 60
+                                      + int(m.group(6)), f.name))
+                clips.sort()
+                for ev in events:
+                    sod = ev.get("seconds_of_day", 0)
+                    ev["clip"], ev["offset"] = None, 0
+                    for start, name in clips:
+                        if start <= sod < start + cfg.segment_seconds:
+                            ev["clip"], ev["offset"] = name, sod - start
+                            break
+                return self.send_json({"events": events})
+
+            if p == "/api/event-days":
+                days = sorted((f.stem for f in (root / "events").glob("*.jsonl")
+                               if DATE_RE.match(f.stem)), reverse=True)
+                return self.send_json({"days": days})
 
             if p.startswith("/static/"):
                 name = Path(p).name
@@ -641,16 +913,6 @@ def make_handler(cfg, root: Path, web_dir: Path):
 
 # ----------------------------------------------------------------------------
 def main():
-    # Windows consoles and redirected pipes default to the legacy code page
-    # (cp1252/cp949 here), where the Korean status lines raise
-    # UnicodeEncodeError and kill the process before recording even starts.
-    # errors="replace" means the worst case is mojibake, never a crash.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
     here = Path(__file__).resolve().parent
     n_env = load_dotenv(here / ".env")
 
@@ -697,6 +959,9 @@ def main():
     stop = threading.Event()
     threading.Thread(target=supervisor, args=(cfg, root, stop), daemon=True).start()
     threading.Thread(target=janitor, args=(cfg, root / "clips", stop), daemon=True).start()
+    if cfg.logbook:
+        threading.Thread(target=analyzer, args=(cfg, root, stop), daemon=True).start()
+        print(f"[logbook] 기록 중 → {root / 'events'}", flush=True)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(cfg, root, web_dir))
     httpd.daemon_threads = True

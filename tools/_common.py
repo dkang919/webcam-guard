@@ -13,6 +13,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import tempfile
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,8 +59,10 @@ def sample_clip_bytes(ffmpeg="ffmpeg", seconds=4) -> bytes | None:
     """
     if not have_ffmpeg(ffmpeg):
         return None
-    tmp = REPO / "_scratch"
-    tmp.mkdir(exist_ok=True)
+    # A real temp dir, NOT REPO/_scratch: the cleanup below is a recursive
+    # delete, and _scratch is where devserver keeps its recordings root. This
+    # used to wipe the folder it had just been asked to fill.
+    tmp = Path(tempfile.mkdtemp(prefix="guard-sample-"))
     out = tmp / "_sample.mp4"
     subprocess.run(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -71,6 +74,47 @@ def sample_clip_bytes(ffmpeg="ffmpeg", seconds=4) -> bytes | None:
     data = out.read_bytes() if out.is_file() else None
     shutil.rmtree(tmp, ignore_errors=True)
     return data
+
+
+def seed_events(events_dir: Path, days=2, per_day=14, end: datetime | None = None) -> int:
+    """Fake logbook entries so the viewer's event lane can be worked on.
+
+    Clustered around waking hours rather than spread evenly - an empty night
+    and a busy evening is what the real strip looks like, and a uniform
+    sprinkle would hide layout problems the real shape exposes.
+    """
+    import json
+    import random
+
+    events_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(7)          # fixed seed: same picture every run
+    end = end or datetime.now()
+    written = 0
+    for d in range(days):
+        day = (end - timedelta(days=d)).date()
+        rows = []
+        for _ in range(per_day):
+            hour = rng.choice([7, 8, 9, 12, 13, 18, 19, 20, 21, 22])
+            start = datetime.combine(day, datetime.min.time()).replace(
+                hour=hour, minute=rng.randrange(60), second=rng.randrange(60))
+            duration = rng.choice([4, 8, 15, 36, 90, 240])
+            faces = rng.choice([0, 0, 0, 1, 1, 2])
+            rows.append({
+                "start": start.strftime("%H:%M:%S"),
+                "end": (start + timedelta(seconds=duration)).strftime("%H:%M:%S"),
+                "seconds_of_day": start.hour * 3600 + start.minute * 60 + start.second,
+                "duration": duration,
+                "kind": "face" if faces else "motion",
+                "faces": faces,
+                "score": round(rng.uniform(1.2, 95.0), 1),
+            })
+        rows.sort(key=lambda r: r["seconds_of_day"])
+        path = events_dir / (day.strftime("%Y-%m-%d") + ".jsonl")
+        with path.open("w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+                written += 1
+    return written
 
 
 def seed_clips(clips_dir: Path, days=2, every_seconds=600, payload=None,

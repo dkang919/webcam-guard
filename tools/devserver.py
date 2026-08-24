@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (REPO, have_ffmpeg, import_guard, make_cfg, prepare_root,
-                     sample_clip_bytes, seed_clips)
+                     sample_clip_bytes, seed_clips, seed_events)
 
 guard = import_guard()
 
@@ -47,6 +47,20 @@ def use_fake_camera(cfg):
     guard.build_input_args = fake
 
 
+def open_access(handler_cls):
+    """Drop Basic auth - dev server only, and only on 127.0.0.1.
+
+    Browsers refuse fetch() from a page whose own URL carries credentials, so
+    http://user:pass@localhost/ loads the viewer but every /api call throws.
+    Subclassing here keeps that workaround out of guard.py, where turning auth
+    off would be a real security switch someone could ship by accident.
+    """
+    class Open(handler_cls):
+        def authed(self):
+            return True
+    return Open
+
+
 def main():
     args = sys.argv[1:]
     days = 2
@@ -61,10 +75,16 @@ def main():
 
     cfg = make_cfg(device="FAKE CAM", password=PASSWORD, port=PORT,
                    root=str(root), channel="DEV ROOM", size="640x360", fps=10,
-                   bitrate="600k", segment_seconds=60, max_gb=1.0)
+                   # Same as production: the logbook resolves an event to a
+                   # clip by this window, so seeding at a different interval
+                   # would leave every event pointing at nothing.
+                   bitrate="600k", segment_seconds=600, max_gb=1.0)
 
     payload = sample_clip_bytes(seconds=3)
-    n = seed_clips(root / "clips", days=days, payload=payload)
+    n = seed_clips(root / "clips", days=days, payload=payload,
+                   every_seconds=cfg.segment_seconds)
+    n_ev = seed_events(root / "events", days=days)
+    print(f"[dev] seeded {n_ev} fake logbook entries")
     print(f"[dev] seeded {n} fake clips over {days} day(s) "
           f"({'playable' if payload else 'placeholder bytes - install ffmpeg for playable ones'})")
 
@@ -80,11 +100,14 @@ def main():
     threading.Thread(target=guard.janitor, args=(cfg, root / "clips", stop),
                      daemon=True).start()
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT),
-                                guard.make_handler(cfg, root, REPO))
+    handler = guard.make_handler(cfg, root, REPO)
+    if "--auth" not in args:
+        handler = open_access(handler)
+    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), handler)
     httpd.daemon_threads = True
     url = f"http://localhost:{PORT}"
-    print(f"[dev] {url}   user: {cfg.user}  password: {PASSWORD}")
+    print(f"[dev] {url}" + ("   user: %s  password: %s" % (cfg.user, PASSWORD)
+                            if "--auth" in args else "   (auth off, --auth to enable)"))
     print("[dev] Ctrl+C to stop")
     if "--no-open" not in args:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
