@@ -35,6 +35,8 @@ tools/       카메라 없이 돌리는 개발·검증 도구 (제품 코드 아
 | **오버레이가 녹화를 죽이면 안 된다** | 폰트를 못 찾으면 필터를 빼고 계속 녹화한다. 장식 때문에 영상 전부를 잃는 건 최악의 트레이드 |
 | **`adopt_child(proc)` 호출을 빼지 말 것** | ffmpeg을 Windows Job Object에 묶는다. 빼면 강제 종료 시 ffmpeg이 고아로 남아 **카메라를 영구 점유**한다 (PROJECT.md 5-9) |
 | **보관 기간을 늘리면 `--max-gb`도 같이** | 둘 중 먼저 걸리는 쪽이 이긴다. `--retain-days`만 올리면 용량 상한에 걸려 실제로는 안 늘어난다 |
+| **`/live/*`는 `send_live()`로만** | ffmpeg이 2초마다 다시 쓴다. `send_file`로 스트리밍하면 PermissionError·길이 불일치·**오류 없이 반쪽짜리 재생목록**이 난다 (PROJECT.md 5-11) |
+| **한국어 출력 전 stdout을 UTF-8로** | 리다이렉트된 출력은 cp949/cp1252이라 한글 print 한 줄에 **시작도 못 하고 죽는다** |
 | **뷰어 색은 7번 섹션 토큰 안에서만** | 강조색(`--sodium`)은 녹화등·선택·타임라인·게이지에만. 새 색 추가 금지 |
 
 ## 소통 규약
@@ -49,7 +51,7 @@ tools/       카메라 없이 돌리는 개발·검증 도구 (제품 코드 아
 python guard.py --list                     # 카메라 이름 찾기
 python guard.py                            # 실행 (설정은 .env 에서)
 python -m py_compile guard.py              # 문법 검사
-python tools/selftest.py                   # 카메라 없이 전체 검증 (36개 항목)
+python tools/selftest.py                   # 카메라 없이 전체 검증 (37개 항목)
 python tools/devserver.py                  # 가짜 카메라로 뷰어 띄우기
 python tools/vendor.py                     # static/ 자산 받기 (1회성)
 ```

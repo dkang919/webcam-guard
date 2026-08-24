@@ -309,6 +309,47 @@ def test_http(root: Path) -> None:
 
         st, _, _ = c.get("/nope")
         check("unknown route -> 404", st == 404, f"got {st}")
+
+        # The live playlist is rewritten by ffmpeg every couple of seconds.
+        # Reading it straight off disk used to hit Windows sharing violations
+        # (PermissionError) and Content-Length mismatches. Recreate that by
+        # rewriting the file - at CHANGING lengths - while requesting it.
+        stop_writer = threading.Event()
+        playlist = root / "live" / "live.m3u8"
+
+        def rewriter():
+            n = 0
+            while not stop_writer.is_set():
+                n += 1
+                # Varying length is the point: a fixed-size file would hide
+                # Content-Length mismatches.
+                body = "#EXTM3U\n#EXT-X-VERSION:3\n" + "".join(
+                    f"#EXTINF:2.0,\nseg{i}.ts\n" for i in range(n % 9 + 1))
+                try:
+                    playlist.write_text(body)
+                except OSError:
+                    pass
+                # ~200 rewrites/sec against ffmpeg's ~0.5. Still 400x harsher
+                # than reality, but not a pathological zero-gap spin.
+                time.sleep(0.005)
+
+        w = threading.Thread(target=rewriter, daemon=True)
+        w.start()
+        bad = []
+        try:
+            for _ in range(400):
+                st, h, body = c.get("/live/live.m3u8")
+                if st != 200:
+                    bad.append(f"status {st}")
+                elif int(h.get("Content-Length", -1)) != len(body):
+                    bad.append("Content-Length mismatch")
+                elif not body.startswith(b"#EXTM3U"):
+                    bad.append("truncated playlist")
+        finally:
+            stop_writer.set()
+            w.join(timeout=5)
+        check("live playlist survives concurrent rewrites (400 reads)",
+              not bad, f"{len(bad)} bad responses, first: {bad[:3]}")
     finally:
         httpd.shutdown()
         httpd.server_close()

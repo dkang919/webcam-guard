@@ -501,6 +501,67 @@ def make_handler(cfg, root: Path, web_dir: Path):
             with path.open("rb") as f:
                 shutil.copyfileobj(f, self.wfile, 262144)
 
+        @staticmethod
+        def playlist_is_complete(data: bytes) -> bool:
+            """Reject a playlist caught mid-rewrite.
+
+            ffmpeg truncates live.m3u8 and writes it again every couple of
+            seconds, so a reader can legitimately observe an empty or
+            half-written file. Nothing raises - the bytes are simply wrong -
+            so the only defence is to check them: a finished playlist starts
+            with the magic line and ends with a complete one.
+            """
+            return data.startswith(b"#EXTM3U") and data.endswith(b"\n")
+
+        def send_live(self, path: Path, ctype: str):
+            """Serve a file ffmpeg is rewriting underneath us.
+
+            The HLS playlist is rewritten every couple of seconds, and two
+            things go wrong if we stream it straight off disk:
+
+              - Windows refuses the open while ffmpeg holds the file
+                (PermissionError / sharing violation), which crashed the
+                request thread and dumped a traceback;
+              - the file can change between stat() and read, so the body no
+                longer matches the Content-Length we already sent and the
+                player gives up with ERR_CONTENT_LENGTH_MISMATCH;
+              - the playlist can be read while it is truncated but not yet
+                rewritten, which raises nothing at all and just serves a
+                half-finished list.
+
+            Reading one snapshot into memory fixes both: live files are small
+            (playlist ~300 B, segment ~400 KB) and the length we announce is
+            the length we are holding. Both failures were reproduced against a
+            real camera before this existed.
+            """
+            for _ in range(6):
+                try:
+                    data = path.read_bytes()
+                except FileNotFoundError:
+                    return self.not_found()      # rotated away by delete_segments
+                except OSError:
+                    time.sleep(0.03)             # mid-rewrite; it is brief
+                    continue
+                if path.name.endswith(".m3u8") and not self.playlist_is_complete(data):
+                    time.sleep(0.03)             # caught between truncate and write
+                    continue
+                return self.send_bytes(data, ctype)
+            # Still busy after ~180ms. 503 tells the player to come back
+            # instead of treating the whole stream as dead.
+            self.send_response(503)
+            self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                # Phones abort video requests constantly - seeking, switching
+                # tabs, screen off. Expected, so it should not look like an
+                # error; a traceback per abort would bury the real ones.
+                self.close_connection = True
+
         # -- routes ----------------------------------------------------------
         def do_GET(self):
             if not self.authed():
@@ -565,7 +626,7 @@ def make_handler(cfg, root: Path, web_dir: Path):
                 name = Path(p).name
                 ctype = ("application/vnd.apple.mpegurl" if name.endswith(".m3u8")
                          else "video/mp2t")
-                return self.send_file(live_dir / name, ctype)
+                return self.send_live(live_dir / name, ctype)
 
             if p.startswith("/clips/"):
                 name = Path(p).name
@@ -580,6 +641,16 @@ def make_handler(cfg, root: Path, web_dir: Path):
 
 # ----------------------------------------------------------------------------
 def main():
+    # Windows consoles and redirected pipes default to the legacy code page
+    # (cp1252/cp949 here), where the Korean status lines raise
+    # UnicodeEncodeError and kill the process before recording even starts.
+    # errors="replace" means the worst case is mojibake, never a crash.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     here = Path(__file__).resolve().parent
     n_env = load_dotenv(here / ".env")
 

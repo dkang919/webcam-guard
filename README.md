@@ -65,7 +65,7 @@ webcam-guard\
 ## 검증 상태
 
 Windows 11 · ffmpeg 9.0 · Logitech C920으로 녹화·실시간·브라우저 재생까지 실제 확인했다.
-`python tools/selftest.py`가 36개 항목을 카메라 없이 재검증한다. 남은 미검증 항목은 [PROJECT.md](PROJECT.md) 2절에 정리돼 있다.
+`python tools/selftest.py`가 37개 항목을 카메라 없이 재검증한다. 남은 미검증 항목은 [PROJECT.md](PROJECT.md) 2절에 정리돼 있다.
 
 ## 문서
 
