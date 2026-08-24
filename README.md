@@ -39,11 +39,11 @@ Windows 10/11 · Python 3.10+ · ffmpeg · USB 웹캠
 ## 빠른 시작
 
 ```powershell
-winget install Gyan.FFmpeg          # 1. ffmpeg 설치 (후 새 PowerShell 창)
-python guard.py --list              # 2. 카메라 이름 확인
-python tools/vendor.py              # 3. 뷰어 자산 내려받기 (1회)
-$env:GUARD_PASSWORD = "비밀번호"
-python guard.py --device "카메라이름"
+winget install Gyan.FFmpeg     # 1. ffmpeg 설치 (후 새 PowerShell 창)
+python guard.py --list         # 2. 카메라 이름 확인
+python tools/vendor.py         # 3. 뷰어 자산 내려받기 (1회)
+copy .env.example .env         # 4. 비밀번호와 카메라 이름을 적고
+python guard.py                # 5. 실행
 ```
 
 브라우저에서 `http://localhost:8088` (아이디 `admin`). 자세한 건 아래.
@@ -54,6 +54,7 @@ python guard.py --device "카메라이름"
 webcam-guard\
   ├─ guard.py                  ← 서버 (이 파일 하나가 전부)
   ├─ index.html                ← 휴대폰 뷰어
+  ├─ .env.example              ← 복사해서 .env 로 쓴다 (비밀번호·카메라 이름)
   ├─ static\                   ← 뷰어가 쓰는 hls.js·폰트 (3-1 참고)
   ├─ start_guard.bat.example   ← 복사해서 자동 실행용으로 쓰는 템플릿
   └─ tools\                    ← 개발·검증용. 운영에는 필요 없음
@@ -64,7 +65,7 @@ webcam-guard\
 ## 검증 상태
 
 Windows 11 · ffmpeg 9.0 · Logitech C920으로 녹화·실시간·브라우저 재생까지 실제 확인했다.
-`python tools/selftest.py`가 27개 항목을 카메라 없이 재검증한다. 남은 미검증 항목은 [PROJECT.md](PROJECT.md) 2절에 정리돼 있다.
+`python tools/selftest.py`가 36개 항목을 카메라 없이 재검증한다. 남은 미검증 항목은 [PROJECT.md](PROJECT.md) 2절에 정리돼 있다.
 
 ## 문서
 
@@ -100,14 +101,32 @@ python guard.py --list
 
 ## 3. 실행
 
+`.env.example`을 복사해 **`.env`**로 저장하고 두 줄만 채워:
+
+```ini
+GUARD_PASSWORD=직접정한비밀번호
+GUARD_DEVICE=HD Webcam
+```
+
+그리고 실행:
+
 ```powershell
-$env:GUARD_PASSWORD = "직접정한비밀번호"
-python guard.py --device "HD Webcam"
+python guard.py
 ```
 
 브라우저에서 `http://localhost:8088` → 아이디 `admin`, 비밀번호는 위에서 정한 값.
 
-> **Why 비밀번호를 환경변수로 넘기나**: `--password "..."`도 그대로 동작하지만, 명령줄 인자는 작업 관리자의 "명령줄" 열이나 `wmic process get commandline`으로 **같은 PC의 다른 프로그램에 그대로 보여**. 환경변수는 그 창 안에만 남아. 둘 다 주면 환경변수가 이긴다.
+> **Why `.env`인가**: 비밀번호를 `--password "..."`로 주면 명령줄 인자에 남는데, 이건 작업 관리자의 "명령줄" 열이나 `wmic process get commandline`으로 **같은 PC의 다른 프로그램에 그대로 보여.** PowerShell 기록에도 남고. `.env`는 파일에만 있고 `.gitignore`에 등록돼 있어서 실수로 커밋될 일도 없어.
+>
+> 참고로 `.env`를 읽는 데 `python-dotenv` 같은 패키지는 안 써. `KEY=값` 한 줄 파싱은 표준 라이브러리로 충분한데, 패키지를 하나 넣는 순간 "설치 명령 한 줄" 원칙이 깨지거든.
+
+**설정 우선순위는 `명령줄 인자` > `환경변수(.env 포함)` > `기본값`.** 그래서 평소 값은 `.env`에 적어두고, 한 번만 다르게 쓰고 싶을 때 인자로 덮으면 돼:
+
+```powershell
+python guard.py --port 9000        # 이번만 9000번 포트로
+```
+
+`guard.py`의 모든 설정을 이렇게 쓸 수 있어. 이름 규칙은 앞에 `GUARD_`를 붙이고 대문자로 (`--retain-days` → `GUARD_RETAIN_DAYS`). 전체 목록은 `.env.example`에 있어.
 
 ### 3-1. 인터넷 없이 쓸 거라면 (권장)
 
@@ -163,16 +182,11 @@ python tools/vendor.py
 
 ## 5. 부팅 시 자동 실행
 
-`start_guard.bat.example`을 **복사해서 `start_guard.bat`으로 저장**하고, 그 안의 두 줄만 네 값으로 바꿔:
-
-```bat
-set "DEVICE=HD Webcam"
-set "GUARD_PASSWORD=직접정한비밀번호"
-```
+`start_guard.bat.example`을 **복사해서 `start_guard.bat`으로 저장**하면 끝이야. 고칠 내용은 없어 — 카메라 이름과 비밀번호는 `.env`에서 읽으니까.
 
 `Win+R` → `shell:startup` → 이 .bat 파일의 **바로가기**를 넣어두면 로그인 시 자동 실행돼.
 
-> **Why 템플릿을 복사해서 쓰는가**: `start_guard.bat`에는 비밀번호가 평문으로 들어가. 그래서 이 파일명은 `.gitignore`에 넣어뒀고, 원본 템플릿만 남긴 거야. 템플릿에는 guard.py 자체가 죽었을 때 10초 뒤 다시 띄우는 루프도 들어있어 (ffmpeg이 죽는 건 guard.py 안의 워치독이 이미 처리해).
+> **뭐가 들었나**: guard.py 자체가 죽었을 때(파이썬 예외) 10초 뒤 다시 띄우는 루프가 있어. ffmpeg이 죽는 건 guard.py 안의 워치독이 이미 처리하고, guard.py가 죽으면 ffmpeg도 같이 정리돼.
 
 > **Why 서비스가 아니라 시작프로그램인가**: 웹캠은 로그인한 사용자 세션에서만 접근돼. Windows 서비스로 등록하면 세션 0에서 돌아 카메라를 못 잡는 경우가 많아.
 

@@ -69,6 +69,60 @@ STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".woff2": "font/wo
 
 
 # ----------------------------------------------------------------------------
+# configuration: .env -> environment -> CLI flags
+# ----------------------------------------------------------------------------
+def load_dotenv(path: Path) -> int:
+    """Read KEY=VALUE lines from a .env file into os.environ.
+
+    A ~20 line parser instead of python-dotenv, because the zero-pip rule is
+    the whole reason this installs with one command. Real environment variables
+    win: a one-off `$env:GUARD_PASSWORD=...` should beat the file on disk.
+
+    utf-8-sig because Notepad writes a BOM, which would otherwise become part
+    of the first key name and silently do nothing.
+    """
+    if not path.is_file():
+        return 0
+    loaded = 0
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
+def env_default(key: str, fallback):
+    """GUARD_<KEY> becomes the argparse default, so an explicit flag still wins.
+
+    Precedence ends up as: CLI flag > environment (incl. .env) > DEFAULTS.
+    """
+    raw = os.environ.get("GUARD_" + key.upper())
+    if raw is None:
+        return fallback
+    if isinstance(fallback, bool):  # before int: bool is a subclass of int
+        return raw.strip().lower() not in ("", "0", "false", "no", "off")
+    if isinstance(fallback, (int, float)):
+        try:
+            return type(fallback)(raw)
+        except ValueError:
+            print(f"[guard] GUARD_{key.upper()} 값이 숫자가 아니야: {raw!r} — 무시할게",
+                  flush=True)
+            return fallback
+    return raw
+
+
+# ----------------------------------------------------------------------------
 # camera discovery
 # ----------------------------------------------------------------------------
 def list_devices(ffmpeg: str) -> None:
@@ -526,15 +580,20 @@ def make_handler(cfg, root: Path, web_dir: Path):
 
 # ----------------------------------------------------------------------------
 def main():
+    here = Path(__file__).resolve().parent
+    n_env = load_dotenv(here / ".env")
+
     ap = argparse.ArgumentParser(description="Windows webcam security recorder")
     ap.add_argument("--list", action="store_true", help="list camera devices and exit")
     for k, v in DEFAULTS.items():
         flag = "--" + k.replace("_", "-")
+        d = env_default(k, v)
         if isinstance(v, bool):
-            ap.add_argument(flag, action="store_true", default=v)
-            ap.add_argument("--no-" + k.replace("_", "-"), dest=k, action="store_false")
+            ap.add_argument(flag, action="store_true", default=d)
+            ap.add_argument("--no-" + k.replace("_", "-"), dest=k,
+                            action="store_false", default=d)
         else:
-            ap.add_argument(flag, default=v, type=type(v) if v is not None else str)
+            ap.add_argument(flag, default=d, type=type(v) if v is not None else str)
     cfg = ap.parse_args()
 
     if cfg.list:
@@ -542,10 +601,12 @@ def main():
     if not cfg.device:
         sys.exit('Missing --device. Run "python guard.py --list" to see camera names.')
 
-    # An env var keeps the password out of the command line, where any other
-    # process on the machine can read it (Task Manager's command line column,
-    # `wmic process get commandline`, shell history). --password still works.
-    cfg.password = os.environ.get("GUARD_PASSWORD") or cfg.password
+    # The password arrived through env_default("password"), i.e. GUARD_PASSWORD
+    # from .env or the environment. Keeping it off the command line matters:
+    # argv is readable by any other process on the machine (Task Manager's
+    # command line column, `wmic process get commandline`, shell history).
+    if n_env:
+        print(f"[guard] .env 에서 설정 {n_env}개를 읽었어", flush=True)
     if cfg.password == DEFAULTS["password"]:
         print("[guard] 경고: 비밀번호가 기본값이야. "
               "GUARD_PASSWORD 환경변수나 --password 로 반드시 바꿔.", flush=True)
@@ -553,7 +614,7 @@ def main():
     root = Path(cfg.root)
     (root / "clips").mkdir(parents=True, exist_ok=True)
     (root / "live").mkdir(parents=True, exist_ok=True)
-    web_dir = Path(__file__).resolve().parent
+    web_dir = here
     if not (web_dir / "index.html").is_file():
         sys.exit("index.html must sit next to guard.py")
     if not (web_dir / "static" / "hls.min.js").is_file():

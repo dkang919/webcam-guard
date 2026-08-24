@@ -12,6 +12,7 @@ ffmpeg 프로세스 **하나**가 웹캠을 잡고 `tee` 먹서로 ① 10분짜�
 
 ```
 guard.py     서버 전체 (단일 파일)   index.html   휴대폰 뷰어
+.env         설정·비밀번호 (gitignore 됨). 템플릿은 .env.example
 static/      내장 hls.js·폰트 (vendor.py 생성물, 손으로 고치지 말 것)
 tools/       카메라 없이 돌리는 개발·검증 도구 (제품 코드 아님)
 ```
@@ -46,9 +47,9 @@ tools/       카메라 없이 돌리는 개발·검증 도구 (제품 코드 아
 
 ```bash
 python guard.py --list                     # 카메라 이름 찾기
-python guard.py --device "HD WebCam"       # 실행 (비밀번호는 GUARD_PASSWORD 환경변수)
+python guard.py                            # 실행 (설정은 .env 에서)
 python -m py_compile guard.py              # 문법 검사
-python tools/selftest.py                   # 카메라 없이 전체 검증 (24개 항목)
+python tools/selftest.py                   # 카메라 없이 전체 검증 (36개 항목)
 python tools/devserver.py                  # 가짜 카메라로 뷰어 띄우기
 python tools/vendor.py                     # static/ 자산 받기 (1회성)
 ```

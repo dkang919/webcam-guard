@@ -37,7 +37,7 @@
 - `tee` 먹서 segment(mp4) + HLS 동시 출력 / HTTP 전 라우트 / Basic 인증 / Range 206 / 경로 탈출 404.
 - 실측 용량: 720p·15fps·1500k에서 **하루 15.4GB** (1080p·15fps·2500k는 26.3GB).
 
-**전부 `python tools/selftest.py` 한 줄로 재현된다. 24개 항목 통과.** 손으로 curl 치지 말 것.
+**전부 `python tools/selftest.py` 한 줄로 재현된다. 36개 항목 통과.** 손으로 curl 치지 말 것.
 
 ### ❌ 아직 검증 안 됨
 
@@ -89,6 +89,7 @@ USB웹캠 │  [supervisor thread] ── subprocess ──> ffmpeg.exe         
 webcam-guard\                  # 레포. 배포 위치는 어디든 상관없다
   ├─ guard.py                  # 서버 전체 (약 400줄, 단일 파일)
   ├─ index.html                # 휴대폰 뷰어 (CSS/JS 인라인, 자산만 static/ 참조)
+  ├─ .env.example              # 설정 템플릿. 복사해서 .env 로 (그쪽은 gitignore)
   ├─ static\                   # 내장 자산. tools/vendor.py 가 받아둔 것
   │   ├─ hls.min.js            #   hls.js 1.5.13 (Apache-2.0)
   │   ├─ fonts.css             #   @font-face. vendor.py 가 생성 — 손대지 말 것
@@ -117,6 +118,7 @@ C:\CamRecordings\  # --root, 실행 시 자동 생성
 | 구역 | 역할 |
 |---|---|
 | `DEFAULTS` | 모든 설정의 단일 출처. argparse가 이 dict를 순회해 CLI 플래그를 자동 생성 |
+| `load_dotenv()` / `env_default()` | 설정 우선순위 **CLI 인자 > 환경변수(.env) > DEFAULTS** (5-10절) |
 | `STATE` | 스레드 간 공유 상태 (recording, started_at, restarts, last_error) |
 | `CLIP_RE` | 파일명 규약 정규식. **파싱·검증·경로차단 3곳에서 재사용** |
 | `STATIC_RE` | `/static/` 화이트리스트. 확장자가 js/css/woff2 인 평범한 이름만 통과 |
@@ -203,6 +205,18 @@ esc = str(font).replace("\\", "/").replace(":", "\\\\:")   # -> C\\:/WINDOWS/Fon
 Windows는 죽는 프로세스의 핸들을 전부 닫아준다. 그래서 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 잡에 ffmpeg을 넣어두면 **우리가 어떻게 죽든** OS가 자식을 같이 죽인다. `_JOB`을 전역으로 살려두는 것도 이 때문이다 — 핸들이 닫히는 순간이 곧 정리 시점이다.
 
 `ctypes`는 표준 라이브러리라 의존성 0개 원칙에 어긋나지 않는다. 실패하면 로그만 남기고 녹화는 계속한다. `tools/selftest.py`가 실제로 부모를 하드킬해 자식이 죽는지 매번 확인한다.
+
+### 5-10. 설정 우선순위: CLI 인자 > 환경변수(.env) > DEFAULTS
+
+**Why 이 순서인가**: `.env`는 "평소 값"이고 명령줄 인자는 "이번만 다르게"다. 반대로 두면 `--port 9000`을 줘도 `.env`가 이겨서 조용히 무시된다.
+
+구현이 미묘하다. `env_default()`가 argparse의 **default**를 만들고, argparse는 인자가 실제로 주어졌을 때만 그 값을 덮는다. 그래서 "인자가 명시됐는지"를 따로 추적할 필요가 없다. 파싱 후에 `os.environ`을 다시 읽어 덮어쓰는 방식으로 바꾸면 **이 순서가 뒤집히니** 하지 말 것.
+
+두 가지 더:
+- **실제 환경변수가 `.env`보다 세다.** `load_dotenv()`는 이미 있는 키를 건드리지 않는다. 일회성으로 `$env:GUARD_PASSWORD`를 준 게 파일에 밀리면 이상하다.
+- **`bool` 검사를 `int`보다 먼저 해야 한다.** 파이썬에서 `bool`은 `int`의 하위 클래스라 순서를 바꾸면 `GUARD_TIMESTAMP=false`가 `int("false")`로 가서 깨진다.
+
+`python-dotenv`를 쓰지 않은 이유는 1절의 의존성 0개 원칙 그대로다. `tools/selftest.py`의 `[config]` 블록이 이 우선순위를 통째로 검증한다.
 
 ---
 

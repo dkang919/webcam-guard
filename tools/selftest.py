@@ -23,6 +23,7 @@ Exit code 0 = all green. Anything else = read the FAIL lines.
 import base64
 import http.client
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,62 @@ def test_pipeline(root: Path, timestamp: bool) -> None:
               "#EXT-X-ENDLIST" not in m3u8.read_text(errors="replace"))
     if timestamp:
         check("drawtext timestamp overlay accepted", True)
+
+
+# ---------------------------------------------------------------------------
+# 0. configuration precedence
+# ---------------------------------------------------------------------------
+def test_config(tmp: Path) -> None:
+    """CLI flag > environment (.env included) > DEFAULTS.
+
+    Worth testing because it fails silently: get it backwards and the viewer
+    quietly runs on the default password while the user believes their .env
+    took effect.
+    """
+    env_file = tmp / ".env"
+    env_file.write_text(
+        "# comment line\n"
+        "\n"
+        "GUARD_PASSWORD = 'from-dotenv'\n"
+        "export GUARD_PORT=9191\n"
+        'GUARD_CHANNEL="ROOM 99"\n'
+        "GUARD_TIMESTAMP=false\n"
+        "GUARD_RETAIN_DAYS=not-a-number\n"
+        "malformed line without equals\n",
+        encoding="utf-8")
+
+    keys = ["GUARD_PASSWORD", "GUARD_PORT", "GUARD_CHANNEL", "GUARD_TIMESTAMP",
+            "GUARD_RETAIN_DAYS", "GUARD_USER"]
+    saved = {k: os.environ.pop(k, None) for k in keys}
+    os.environ["GUARD_USER"] = "already-set"   # a real env var must not be overwritten
+    try:
+        n = guard.load_dotenv(env_file)
+        check("load_dotenv skips comments, blanks and malformed lines", n == 5,
+              f"loaded {n} keys, expected 5")
+        check("quotes are stripped and 'export' is tolerated",
+              os.environ.get("GUARD_PASSWORD") == "from-dotenv"
+              and os.environ.get("GUARD_PORT") == "9191"
+              and os.environ.get("GUARD_CHANNEL") == "ROOM 99",
+              f"{os.environ.get('GUARD_PASSWORD')!r} {os.environ.get('GUARD_PORT')!r}")
+        check("a real environment variable beats .env",
+              os.environ.get("GUARD_USER") == "already-set")
+        check("env value overrides the built-in default",
+              guard.env_default("password", "changeme") == "from-dotenv")
+        check("typed values are converted", guard.env_default("port", 8088) == 9191)
+        check("booleans understand false/no/off",
+              guard.env_default("timestamp", True) is False)
+        check("a non-numeric value falls back instead of crashing",
+              guard.env_default("retain_days", 10) == 10)
+        check("keys with no env var keep the default",
+              guard.env_default("bitrate", "1500k") == "1500k")
+        check("load_dotenv on a missing file is a no-op",
+              guard.load_dotenv(tmp / "nope.env") == 0)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +325,8 @@ def main():
 
     tmp = Path(tempfile.mkdtemp(prefix="guard-selftest-"))
     try:
+        print("\n[config]    .env parsing and the precedence chain")
+        test_config(prepare_root(tmp / "cfg"))
         if run_pipe:
             if have_ffmpeg():
                 print("\n[pipeline]  lavfi testsrc -> tee -> segment + hls")
