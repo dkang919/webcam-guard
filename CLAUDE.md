@@ -14,6 +14,7 @@ ffmpeg 프로세스 **하나**가 웹캠을 잡고 `tee` 먹서로 ① 10분짜�
 guard.py     서버 전체 (단일 파일)   index.html   휴대폰 뷰어
 .env         설정·비밀번호 (gitignore 됨). 템플릿은 .env.example
 static/      내장 hls.js·폰트 (vendor.py 생성물, 손으로 고치지 말 것)
+events/      로그북. 날짜별 JSON Lines (--root 아래)
 tools/       카메라 없이 돌리는 개발·검증 도구 (제품 코드 아님)
 ```
 
