@@ -5,10 +5,12 @@
 Frigate·motionEye 같은 기성품 대신 직접 만들었다. 필요한 기능이 셋뿐인데 그것들은 Docker와 설정 파일을 요구했고, 무엇보다 **영상이 어디로 가는지 내가 알 수 있어야** 했다. 여기서는 녹화물이 네 PC의 폴더 밖으로 나가지 않는다.
 
 ```
-ffmpeg 1개 프로세스 ──┬── clips/  10분짜리 mp4 아카이브
-   (웹캠을 점유)      └── live/   HLS 실시간 스트림
-                            ↑
-              guard.py (감시 · 자동삭제 · HTTP 서버)
+ffmpeg 1개 프로세스 ──┬── clips/   10분짜리 mp4 아카이브
+   (웹캠을 점유)      └── live/    HLS 실시간 스트림
+                            │              │
+                            │              └─> 움직임·얼굴 분석
+                            ↓                        ↓
+              guard.py (감시 · 자동삭제 · HTTP)   events/  로그북
                             ↑
                     휴대폰 브라우저
 ```
@@ -59,10 +61,20 @@ webcam-guard\
   ├─ .env.example              ← 복사해서 .env 로 쓴다 (비밀번호·카메라 이름)
   ├─ static\                   ← 뷰어가 쓰는 hls.js·폰트 (3-1 참고)
   ├─ start_guard.bat.example   ← 복사해서 자동 실행용으로 쓰는 템플릿
+  ├─ README.md  PROJECT.md  CHANGELOG.md  CLAUDE.md
   └─ tools\                    ← 개발·검증용. 운영에는 필요 없음
 ```
 
 `guard.py`와 `index.html`은 **같은 폴더**에 있어야 한다.
+
+녹화물은 코드와 따로 `--root`(기본 `C:\CamRecordings`)에 쌓여:
+
+```
+C:\CamRecordings\
+  ├─ clips\    10분짜리 mp4
+  ├─ live\     실시간용 임시 파일 (계속 순환, 지워도 됨)
+  └─ events\   로그북. 날짜별 파일, 하루 몇 KB
+```
 
 ## 검증 상태
 
@@ -72,6 +84,7 @@ Windows 11 · ffmpeg 9.0 · Logitech C920으로 녹화·실시간·브라우저 
 ## 문서
 
 - **[PROJECT.md](PROJECT.md)** — 설계 의도, 검증 상태, "손대면 안 되는 것". 코드를 고칠 거면 먼저 읽을 것
+- **[CHANGELOG.md](CHANGELOG.md)** — 무엇이 왜 바뀌었는지. 실측으로 뒤집힌 결정들이 여기 있어
 - **[CLAUDE.md](CLAUDE.md)** — AI 에이전트용 요약본
 
 ---
@@ -151,8 +164,12 @@ python tools/vendor.py
 | `--retain-days` | `10` | 이 일수가 지나면 삭제 (실제로 보관 기간을 정하는 값) |
 | `--segment-seconds` | `600` | 파일 하나의 길이(10분) |
 | `--port` | `8088` | 웹 뷰어 포트 |
+| `--user` | `admin` | 뷰어 로그인 아이디 |
+| `--channel` | `ROOM 01` | 뷰어 상단에 뜨는 이름. 카메라가 여러 대면 구분용 |
 | `--no-timestamp` | — | 화면 속 시각 표시 끄기 |
 | `--input-codec mjpeg` | — | 프레임이 낮거나 입력 실패할 때 |
+
+로그북 관련 옵션은 [3-2](#3-2-로그북--움직임얼굴-기록)에 따로 있어. 전체 목록은 `.env.example` 아니면 `python guard.py --help`.
 
 > **Why 10분 단위로 쪼개는가**: 24시간을 한 파일로 녹화하면 정전·강제종료 시 파일 전체가 깨져. 세그먼트 방식이면 마지막 10분만 손실돼. 특정 시각을 찾기도 쉬워.
 
@@ -253,6 +270,8 @@ GUARD_MOTION_THRESHOLD=1.0
 - 실시간 화면은 HLS 방식이라 **3~6초 지연**이 있어. 이건 정상이고, 지연을 더 줄이려면 WebRTC가 필요한데 구조가 훨씬 복잡해져.
 - `tools/vendor.py`를 돌려두면 뷰어가 외부 인터넷을 **전혀** 쓰지 않아. 안 돌렸다면 hls.js만 CDN에서 가져와(아이폰 Safari는 그것도 필요 없어).
 - 카메라를 다른 앱(줌, 팀즈)이 쓰고 있으면 ffmpeg이 장치를 못 잡아. 상태창의 재시작 횟수가 계속 올라가면 이걸 의심해.
+- **로그북 기록(`events/`)은 자동으로 안 지워져.** 하루에 몇 KB 수준이라 몇 년을 둬도 괜찮아. 다만 클립은 10일 뒤 사라지니까, 오래된 기록을 눌러도 영상이 없을 수 있어(뷰어가 "이 시각의 클립이 아직 없어"라고 알려줘).
+- **영상 자체는 아무 데도 안 올라가.** 분석도 네 PC 안에서 끝나고, 로그북에는 시각·종류·지속시간만 남지 사진은 저장하지 않아.
 
 ## 문제 해결
 
@@ -263,7 +282,11 @@ GUARD_MOTION_THRESHOLD=1.0
 | 프레임이 뚝뚝 끊김 | `--input-codec mjpeg` 추가, 또는 `--size 640x480` |
 | `drawtext` 오류 | `--no-timestamp`로 실행 (폰트 경로 문제) |
 | 실시간 화면만 안 나옴 (안드로이드) | `python tools/vendor.py`를 안 돌렸고 PC가 인터넷에 못 나가는 경우 |
-| CPU 100% | `--preset`은 이미 veryfast — `--fps 10`, `--size 640x480`으로 낮춰 |
+| CPU 100% | `--preset`은 이미 veryfast — `--fps 10`, `--size 640x480`으로 낮춰. 로그북도 `--no-faces`로 절반 줄어 |
+| **로그북이 계속 비어 있음** | 감도가 너무 둔한 것. `python tools/calibrate.py --from-live`로 실제 값을 보고 `GUARD_MOTION_THRESHOLD`를 낮춰 |
+| **빈 방인데 기록이 잔뜩** | 반대로 너무 예민한 것. 화면에 TV·모니터·창밖 나뭇가지가 들어와 있는지 보고 임계값을 올려 |
+| **얼굴이 하나도 안 잡힘** | OpenCV가 없는 상태야. 상태창의 `오늘 감지`에 `(모션)`이라고 뜨면 그 뜻이야. `pip install opencv-python` |
+| 기동할 때마다 사건이 하나 생김 | 정상이야. 카메라 자동노출이 잡히는 첫 2초는 화면 전체가 변해 |
 
 ### 고아 ffmpeg (해결됨)
 
